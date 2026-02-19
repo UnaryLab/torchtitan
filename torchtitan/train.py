@@ -12,6 +12,7 @@ from typing import Any, Generator, Iterable, Optional
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.profiler import record_function
 
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
@@ -609,7 +610,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.step += 1
                 self.gc_handler.run(self.step)
                 try:
-                    self.train_step(data_iterator)
+                    with record_function(f"Iteration{self.step}"):
+                        self.train_step(data_iterator)
                 except DataloaderExhaustedError:
                     logger.warning("Ran out of data; last step was canceled.")
                     break

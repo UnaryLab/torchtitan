@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import and_masks, BlockMask
+from torch.profiler import record_function
 
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.models.attention import (
@@ -500,8 +501,9 @@ class Transformer(nn.Module, ModelProtocol):
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis, attention_masks=attention_masks)
+        for i, layer in enumerate(self.layers.values()):
+            with record_function(f"Layer{i}"):
+                h = layer(h, self.freqs_cis, attention_masks=attention_masks)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h

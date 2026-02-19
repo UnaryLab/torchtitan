@@ -25,6 +25,7 @@ from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import DeepSeekV3ModelArgs
 
+from torch.profiler import record_function
 
 # Adapted from https://github.com/DeepSeek-ai/DeepSeek-V3/blob/main/inference/model.py#L294
 def precompute_freqs_cis(args: DeepSeekV3ModelArgs) -> torch.Tensor:
@@ -432,8 +433,9 @@ class DeepSeekV3Model(nn.Module, ModelProtocol):
 
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis, attention_masks)
+        for i, layer in enumerate(self.layers.values()):
+            with record_function(f"Layer{i}"):
+                h = layer(h, self.freqs_cis, attention_masks)
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h
         return output

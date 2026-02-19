@@ -13,10 +13,32 @@ import torch
 
 from torchtitan.config import Profiling as ProfilingConfig
 from torchtitan.tools.logging import logger
+from torchtitan.tools.straggler_detection import get_straggler_gpus
+
+import numpy as np
+import math
+from amdsmi import amdsmi_get_processor_handles, amdsmi_get_gpu_kfd_info, amdsmi_init, amdsmi_shut_down, amdsmi_set_power_cap
 
 # how much memory allocation/free ops to record in memory snapshots
 MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
 
+pending_counter = 0
+wait_counter = 0
+max_lead = 0
+
+def set_pow(gpu_num: int, val: int):
+    amdsmi_init()
+
+    devices = amdsmi_get_processor_handles()
+    gpu_ids = {}
+    for device in devices:
+        gpu_ids[amdsmi_get_gpu_kfd_info(device)['node_id']-2] = device
+
+    device = gpu_ids[gpu_num]
+    logger.info(f"Setting GPU{gpu_num} power to {val} W")
+    amdsmi_set_power_cap(device, 0, int(val * 1000000))
+
+    amdsmi_shut_down()
 
 @contextlib.contextmanager
 def maybe_enable_profiling(
@@ -25,6 +47,17 @@ def maybe_enable_profiling(
     global_step: int = 0,
     base_folder: str = "",
     leaf_folder: str = "",
+    power_man: bool = True,
+    max_adj: int = 15,
+    use_global: bool = True,
+    use_sum: bool = True,
+    use_max: bool = False,
+    use_last: bool = False,
+    wait_steps: int = 2,
+    adjust_steps: int = 3,
+    initial_power_cap: int = 750,
+    fake_max_power: int = 750,
+    max_power: int = 750,
 ):
     # get user defined profiler settings
     enable_profiling = profiling_config.enable_profiling
@@ -37,7 +70,15 @@ def maybe_enable_profiling(
             profiling_config.profiler_active,
         )
 
+        gpu_power = [initial_power_cap for _ in range(8)]
+        gpu_pending = [[] for _ in range(8)]
+
         rank = torch.distributed.get_rank()
+
+        if rank == 0:
+            for gpu_num in range(8):
+                logger.info(f"Setting initial power cap for GPU{gpu_num}: {gpu_power[gpu_num]}")
+                set_pow(gpu_num, gpu_power[gpu_num])
 
         def trace_handler(prof):
             curr_trace_dir_name = "iteration_" + str(prof.step_num)
@@ -53,6 +94,77 @@ def maybe_enable_profiling(
             logger.info(
                 f"Finished dumping profiler traces in {time.monotonic() - begin:.2f} seconds"
             )
+
+            global pending_counter
+            global wait_counter
+            global max_lead
+            if power_man:
+                torch.distributed.barrier()
+                if torch.distributed.get_rank() == 0:
+                    logger.info("Tweaking frequency...")
+                    # WARN hardcoded for 8 GPUs
+                    gpu_traces = [os.path.join(curr_trace_dir, f"rank{rank_}_trace.json") for rank_ in range(8)]
+                    for gpu_trace in gpu_traces:
+                        assert os.path.exists(gpu_trace)
+
+                    straggler_gpus, max_lead = get_straggler_gpus(
+                        gpu_traces,
+                        max_adj,
+                        invert=True,
+                        max_lead=max_lead if use_global else 0,
+                        use_sum=use_sum,
+                        use_max=use_max,
+                        use_last=use_last,
+                    )
+
+                    for gpu_num, delta in straggler_gpus.items():
+                        logger.info("Pending deltas:")
+                        logger.info(f"  GPU{gpu_num}: {delta:.3f} W")
+                    if wait_counter < wait_steps:
+                        logger.info(f"Waiting steps {wait_steps - wait_counter} left...")
+                        wait_counter += 1
+                    elif pending_counter == adjust_steps - 1:
+                        # Adjust power distribution
+                        pending_counter = 0
+                        avg_deltas = {}
+                        for gpu_num, delta in straggler_gpus.items():
+                            gpu_pending[gpu_num].append(delta)
+                            avg_delta = np.median(gpu_pending[gpu_num]).astype(int)
+                            gpu_pending[gpu_num] = []
+                            avg_deltas[gpu_num] = avg_delta
+                        for gpu_num, avg_delta in avg_deltas.items():
+                            gpu_power[gpu_num] += avg_delta
+                        total_power = sum(gpu_power)
+                        power_delta = math.ceil((total_power - fake_max_power * 8)/8)
+                        logger.info(f"Total Power: {total_power - power_delta*8}")
+                        assert total_power-power_delta*8 <= fake_max_power * 8
+
+                        # Uniformly raise or lower power distribution
+                        gpu_delta = 0
+                        for gpu_num in avg_deltas.keys():
+                            gpu_power[gpu_num] -= power_delta
+                            gpu_delta = max(gpu_delta, gpu_power[gpu_num] - max_power)
+                        # Uniformly lower if any GPUs are above TDP
+                        for gpu_num in avg_deltas.keys():
+                            gpu_power[gpu_num] -= gpu_delta
+
+                        underutil = fake_max_power * 8 - sum(gpu_power)
+                        assert underutil >= 0, f"{-1 * underutil} W over the limit"
+                        if underutil > 0:
+                            logger.warning(f"Operating {underutil} W lower than allowed")
+                        logger.info("Final power deltas:")
+                        for gpu_num, avg_delta in avg_deltas.items():
+                            logger.info(f"  GPU{gpu_num}: {avg_delta:.3f} W")
+                            new_cap = gpu_power[gpu_num]
+                            assert new_cap <= max_power
+                            logger.info(f"Adjusting GPU{gpu_num}...")
+                            set_pow(gpu_num, new_cap)
+                    else:
+                        pending_counter += 1
+                        for gpu_num, delta in straggler_gpus.items():
+                            logger.info(f"Accumulating deltas for GPU{gpu_num}...")
+                            gpu_pending[gpu_num].append(delta)
+                torch.distributed.barrier()
 
         logger.info(f"Profiling active. Traces will be saved at {trace_dir}")
 
