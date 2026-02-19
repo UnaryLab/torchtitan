@@ -23,7 +23,6 @@ def json_to_pandas(json_fn: str) -> pd.DataFrame:
     kernel_data = []
 
     with open(json_fn, 'r') as fp:
-        logger.info(f'Reading {path.basename(json_fn)}...')
         for line in json.load(fp, parse_float=Decimal)['traceEvents']:
             if 'cat' in line and line['cat'] == 'kernel':
                 kernel_link(

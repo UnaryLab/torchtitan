@@ -35,8 +35,8 @@ def set_pow(gpu_num: int, val: int):
         gpu_ids[amdsmi_get_gpu_kfd_info(device)['node_id']-2] = device
 
     device = gpu_ids[gpu_num]
-    logger.info(f"Setting GPU{gpu_num} power to {val} W")
-    amdsmi_set_power_cap(device, 0, int(val * 1000000))
+    logger.info(f"Setting GPU{gpu_num} power to {val/1000000:.3f} W")
+    amdsmi_set_power_cap(device, 0, int(val))
 
     amdsmi_shut_down()
 
@@ -48,16 +48,16 @@ def maybe_enable_profiling(
     base_folder: str = "",
     leaf_folder: str = "",
     power_man: bool = True,
-    max_adj: int = 15,
+    max_adj: int = 8000000,
     use_global: bool = True,
     use_sum: bool = True,
     use_max: bool = False,
     use_last: bool = False,
-    wait_steps: int = 2,
+    wait_steps: int = 20,
     adjust_steps: int = 3,
-    initial_power_cap: int = 750,
-    fake_max_power: int = 750,
-    max_power: int = 750,
+    initial_power_cap: int = 750000000,
+    fake_max_power: int = 750000000,
+    max_power: int = 750000000,
 ):
     # get user defined profiler settings
     enable_profiling = profiling_config.enable_profiling
@@ -77,7 +77,7 @@ def maybe_enable_profiling(
 
         if rank == 0:
             for gpu_num in range(8):
-                logger.info(f"Setting initial power cap for GPU{gpu_num}: {gpu_power[gpu_num]}")
+                logger.info(f"Setting initial power cap for GPU{gpu_num}: {gpu_power[gpu_num]/1000000:.3f}")
                 set_pow(gpu_num, gpu_power[gpu_num])
 
         def trace_handler(prof):
@@ -118,8 +118,7 @@ def maybe_enable_profiling(
                     )
 
                     for gpu_num, delta in straggler_gpus.items():
-                        logger.info("Pending deltas:")
-                        logger.info(f"  GPU{gpu_num}: {delta:.3f} W")
+                        logger.info(f"Pending delta GPU{gpu_num}: {delta/1000000:.3f} W")
                     if wait_counter < wait_steps:
                         logger.info(f"Waiting steps {wait_steps - wait_counter} left...")
                         wait_counter += 1
@@ -136,7 +135,7 @@ def maybe_enable_profiling(
                             gpu_power[gpu_num] += avg_delta
                         total_power = sum(gpu_power)
                         power_delta = math.ceil((total_power - fake_max_power * 8)/8)
-                        logger.info(f"Total Power: {total_power - power_delta*8}")
+                        logger.info(f"Total Power: {(total_power - power_delta*8)/1000000:.3f} W")
                         assert total_power-power_delta*8 <= fake_max_power * 8
 
                         # Uniformly raise or lower power distribution
@@ -149,20 +148,18 @@ def maybe_enable_profiling(
                             gpu_power[gpu_num] -= gpu_delta
 
                         underutil = fake_max_power * 8 - sum(gpu_power)
-                        assert underutil >= 0, f"{-1 * underutil} W over the limit"
+                        assert underutil >= 0, f"{-1 * underutil/1000000:.3f} W over the limit"
                         if underutil > 0:
-                            logger.warning(f"Operating {underutil} W lower than allowed")
+                            logger.warning(f"Operating {underutil/1000000:.3f} W lower than node cap")
                         logger.info("Final power deltas:")
                         for gpu_num, avg_delta in avg_deltas.items():
-                            logger.info(f"  GPU{gpu_num}: {avg_delta:.3f} W")
+                            logger.info(f"  GPU{gpu_num}: {avg_delta/1000000:.3f} W")
                             new_cap = gpu_power[gpu_num]
                             assert new_cap <= max_power
-                            logger.info(f"Adjusting GPU{gpu_num}...")
                             set_pow(gpu_num, new_cap)
                     else:
                         pending_counter += 1
                         for gpu_num, delta in straggler_gpus.items():
-                            logger.info(f"Accumulating deltas for GPU{gpu_num}...")
                             gpu_pending[gpu_num].append(delta)
                 torch.distributed.barrier()
 
