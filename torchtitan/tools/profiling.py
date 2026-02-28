@@ -17,7 +17,19 @@ from torchtitan.tools.straggler_detection import get_straggler_gpus
 
 import numpy as np
 import math
-from amdsmi import amdsmi_get_processor_handles, amdsmi_get_gpu_kfd_info, amdsmi_init, amdsmi_shut_down, amdsmi_set_power_cap
+
+# Do this if you have admin privileges:
+# from amdsmi import amdsmi_get_processor_handles, amdsmi_get_gpu_kfd_info, amdsmi_init, amdsmi_shut_down, amdsmi_set_power_cap
+
+# Do this if you don't have admin privileges:
+import grpc
+import grpc.experimental
+
+# from importlib.resources import files
+
+# protos, services = grpc.protos_and_services(
+#     str(files("torchtitan.tools").joinpath("power.proto")))
+protos, services = grpc.protos_and_services("power.proto")
 
 # how much memory allocation/free ops to record in memory snapshots
 MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
@@ -26,19 +38,35 @@ pending_counter = 0
 wait_counter = 0
 max_lead = 0
 
-def set_pow(gpu_num: int, val: int):
-    amdsmi_init()
+# Do this if you have admin privileges:
+# def set_pow(gpu_num: int, val: int):
+#     amdsmi_init()
 
-    devices = amdsmi_get_processor_handles()
-    gpu_ids = {}
-    for device in devices:
-        gpu_ids[amdsmi_get_gpu_kfd_info(device)['node_id']-2] = device
+#     devices = amdsmi_get_processor_handles()
+#     gpu_ids = {}
+#     for device in devices:
+#         gpu_ids[amdsmi_get_gpu_kfd_info(device)['node_id']-2] = device
 
-    device = gpu_ids[gpu_num]
-    logger.info(f"Setting GPU{gpu_num} power to {val/1000000:.3f} W")
-    amdsmi_set_power_cap(device, 0, int(val))
+#     device = gpu_ids[gpu_num]
+#     logger.info(f"Setting GPU{gpu_num} power to {val/1000000:.3f} W")
+#     amdsmi_set_power_cap(device, 0, int(val))
 
-    amdsmi_shut_down()
+#     amdsmi_shut_down()
+
+
+def set_pow(gpu_num: int, val: int, grpc_socket: str):
+    response = services.PowerServer.SetPower(
+        protos.PowerReq(gpu=gpu_num, watts=val),
+        f'unix://{grpc_socket}',
+        insecure=True,
+    )
+    if response.ack == 0:
+        logger.info("Successfully set power")
+    elif response.ack == 1:
+        logger.error("Failed to set power")
+    else:
+        raise ValueError(f"Unexpected ack: {response.ack}")
+
 
 @contextlib.contextmanager
 def maybe_enable_profiling(
@@ -47,17 +75,6 @@ def maybe_enable_profiling(
     global_step: int = 0,
     base_folder: str = "",
     leaf_folder: str = "",
-    power_man: bool = True,
-    max_adj: int = 8000000,
-    use_global: bool = True,
-    use_sum: bool = True,
-    use_max: bool = False,
-    use_last: bool = False,
-    wait_steps: int = 20,
-    adjust_steps: int = 3,
-    initial_power_cap: int = 750000000,
-    fake_max_power: int = 750000000,
-    max_power: int = 750000000,
 ):
     # get user defined profiler settings
     enable_profiling = profiling_config.enable_profiling
@@ -70,15 +87,15 @@ def maybe_enable_profiling(
             profiling_config.profiler_active,
         )
 
-        gpu_power = [initial_power_cap for _ in range(8)]
+        gpu_power = [profiling_config.initial_power_cap for _ in range(8)]
         gpu_pending = [[] for _ in range(8)]
 
         rank = torch.distributed.get_rank()
 
-        if rank == 0:
+        if rank == 0 and profiling_config.power_man:
             for gpu_num in range(8):
-                logger.info(f"Setting initial power cap for GPU{gpu_num}: {gpu_power[gpu_num]/1000000:.3f}")
-                set_pow(gpu_num, gpu_power[gpu_num])
+                logger.info(f"Setting initial power cap for GPU{gpu_num}: {gpu_power[gpu_num]:.3f}")
+                set_pow(gpu_num, gpu_power[gpu_num], profiling_config.grpc_socket)
 
         def trace_handler(prof):
             curr_trace_dir_name = "iteration_" + str(prof.step_num)
@@ -98,7 +115,7 @@ def maybe_enable_profiling(
             global pending_counter
             global wait_counter
             global max_lead
-            if power_man:
+            if profiling_config.power_man:
                 torch.distributed.barrier()
                 if torch.distributed.get_rank() == 0:
                     logger.info("Tweaking frequency...")
@@ -109,20 +126,20 @@ def maybe_enable_profiling(
 
                     straggler_gpus, max_lead = get_straggler_gpus(
                         gpu_traces,
-                        max_adj,
+                        profiling_config.max_adj,
                         invert=True,
-                        max_lead=max_lead if use_global else 0,
-                        use_sum=use_sum,
-                        use_max=use_max,
-                        use_last=use_last,
+                        max_lead=max_lead if profiling_config.use_global else 0,
+                        use_sum=profiling_config.use_sum,
+                        use_max=profiling_config.use_max,
+                        use_last=profiling_config.use_last,
                     )
 
                     for gpu_num, delta in straggler_gpus.items():
-                        logger.info(f"Pending delta GPU{gpu_num}: {delta/1000000:.3f} W")
-                    if wait_counter < wait_steps:
-                        logger.info(f"Waiting steps {wait_steps - wait_counter} left...")
+                        logger.info(f"Pending delta GPU{gpu_num}: {delta:.3f} W")
+                    if wait_counter < profiling_config.wait_steps:
+                        logger.info(f"Waiting steps {profiling_config.wait_steps - wait_counter} left...")
                         wait_counter += 1
-                    elif pending_counter == adjust_steps - 1:
+                    elif pending_counter == profiling_config.adjust_steps - 1:
                         # Adjust power distribution
                         pending_counter = 0
                         avg_deltas = {}
@@ -134,29 +151,29 @@ def maybe_enable_profiling(
                         for gpu_num, avg_delta in avg_deltas.items():
                             gpu_power[gpu_num] += avg_delta
                         total_power = sum(gpu_power)
-                        power_delta = math.ceil((total_power - fake_max_power * 8)/8)
-                        logger.info(f"Total Power: {(total_power - power_delta*8)/1000000:.3f} W")
-                        assert total_power-power_delta*8 <= fake_max_power * 8
+                        power_delta = math.ceil((total_power - profiling_config.fake_max_power * 8)/8)
+                        logger.info(f"Total Power: {(total_power - power_delta*8):.3f} W")
+                        assert total_power-power_delta*8 <= profiling_config.fake_max_power * 8
 
                         # Uniformly raise or lower power distribution
                         gpu_delta = 0
                         for gpu_num in avg_deltas.keys():
                             gpu_power[gpu_num] -= power_delta
-                            gpu_delta = max(gpu_delta, gpu_power[gpu_num] - max_power)
+                            gpu_delta = max(gpu_delta, gpu_power[gpu_num] - profiling_config.max_power)
                         # Uniformly lower if any GPUs are above TDP
                         for gpu_num in avg_deltas.keys():
                             gpu_power[gpu_num] -= gpu_delta
 
-                        underutil = fake_max_power * 8 - sum(gpu_power)
-                        assert underutil >= 0, f"{-1 * underutil/1000000:.3f} W over the limit"
+                        underutil = profiling_config.fake_max_power * 8 - sum(gpu_power)
+                        assert underutil >= 0, f"{-1 * underutil:.3f} W over the limit"
                         if underutil > 0:
-                            logger.warning(f"Operating {underutil/1000000:.3f} W lower than node cap")
+                            logger.warning(f"Operating {underutil:.3f} W lower than node cap")
                         logger.info("Final power deltas:")
                         for gpu_num, avg_delta in avg_deltas.items():
-                            logger.info(f"  GPU{gpu_num}: {avg_delta/1000000:.3f} W")
+                            logger.info(f"  GPU{gpu_num}: {avg_delta:.3f} W")
                             new_cap = gpu_power[gpu_num]
-                            assert new_cap <= max_power
-                            set_pow(gpu_num, new_cap)
+                            assert new_cap <= profiling_config.max_power
+                            set_pow(gpu_num, new_cap, profiling_config.grpc_socket)
                     else:
                         pending_counter += 1
                         for gpu_num, delta in straggler_gpus.items():

@@ -60,6 +60,20 @@ class Profiling:
     save_memory_snapshot_folder: str = "memory_snapshot"
     """Memory snapshot files location"""
 
+    power_man: bool = False
+    max_adj: int = 8
+    use_global: bool = True
+    use_sum: bool = True
+    use_max: bool = False
+    use_last: bool = False
+    wait_steps: int = 20
+    adjust_steps: int = 3
+    initial_power_cap: int = 750
+    fake_max_power: int = 750
+    max_power: int = 750
+    grpc_socket: str = "/tmp/power.sock"
+    """Power-capping variables for Lit Silicon"""
+
 
 @dataclass
 class Metrics:
