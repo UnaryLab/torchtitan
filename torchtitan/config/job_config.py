@@ -66,7 +66,7 @@ class Profiling:
     use_sum: bool = True
     use_max: bool = False
     use_last: bool = False
-    wait_steps: int = 20
+    wait_steps: int = 50
     adjust_steps: int = 3
     initial_power_cap: int = 750
     fake_max_power: int = 750
