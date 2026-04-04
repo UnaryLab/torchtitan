@@ -222,41 +222,53 @@ class Attention(nn.Module):
         """
 
         bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        with record_function("attn_qp"):
+            xq = self.wq(x)
+        with record_function("attn_kp"):
+            xk = self.wk(x)
+        with record_function("attn_vp"):
+            xv = self.wv(x)
 
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
         # local heads from sizes of xq, xk, and xv as TP may have sharded them
         # after the above linear ops.
-        xq = xq.view(bs, seqlen, -1, self.head_dim)
-        xk = xk.view(bs, seqlen, -1, self.head_dim)
-        xv = xv.view(bs, seqlen, -1, self.head_dim)
+        with record_function("attn_v"):
+            xq = xq.view(bs, seqlen, -1, self.head_dim)
+            xk = xk.view(bs, seqlen, -1, self.head_dim)
+            xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        with record_function("attn_re"):
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        with record_function("attn_kv"):
+            keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+            values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        with record_function("attn_t"):
+            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         assert (
             isinstance(attention_masks, BlockMask) or attention_masks is None
         ), attention_masks
 
-        if self.use_flex_attn:
-            assert isinstance(attention_masks, BlockMask), attention_masks
-            output = self.inner_attention(xq, xk, xv, block_mask=attention_masks)
-        else:
-            assert attention_masks is None
-            output = self.inner_attention(xq, xk, xv)
+        with record_function("attn_fa"):
+            if self.use_flex_attn:
+                assert isinstance(attention_masks, BlockMask), attention_masks
+                output = self.inner_attention(xq, xk, xv, block_mask=attention_masks)
+            else:
+                assert attention_masks is None
+                output = self.inner_attention(xq, xk, xv)
 
-        output = output.transpose(
-            1, 2
-        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
-        output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+        with record_function("attn_or"):
+            output = output.transpose(
+                1, 2
+            ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+            output = output.view(bs, seqlen, -1)
+        with record_function("attn_op"):
+            return self.wo(output)
 
 
 class FeedForward(nn.Module):
@@ -295,7 +307,16 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        with record_function("mlp_gp"):
+            w1_out = self.w1(x)
+        with record_function("mlp_gs"):
+            silu_out = F.silu(w1_out)
+        with record_function("mlp_up"):
+            w3_out = self.w3(x)
+        with record_function("mlp_gu"):
+            hidden = silu_out * w3_out
+        with record_function("mlp_dp"):
+            return self.w2(hidden)
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
@@ -359,8 +380,14 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis, attention_masks)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        with record_function("attn_n"):
+            attn_norm = self.attention_norm(x)
+        with record_function("attn_ra"):
+            h = x + self.attention(attn_norm, freqs_cis, attention_masks)
+        with record_function("mlp_n"):
+            ffn_norm = self.ffn_norm(h)
+        with record_function("mlp_ra"):
+            out = h + self.feed_forward(ffn_norm)
         return out
 
     def init_weights(self):
@@ -499,12 +526,15 @@ class Transformer(nn.Module, ModelProtocol):
 
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        with record_function("ie"):
+            h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         for i, layer in enumerate(self.layers.values()):
             with record_function(f"Layer{i}"):
                 h = layer(h, self.freqs_cis, attention_masks=attention_masks)
 
-        h = self.norm(h) if self.norm else h
-        output = self.output(h) if self.output else h
+        with record_function("ln"):
+            h = self.norm(h) if self.norm else h
+        with record_function("lp"):
+            output = self.output(h) if self.output else h
         return output
