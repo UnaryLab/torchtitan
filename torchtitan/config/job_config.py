@@ -61,7 +61,7 @@ class Profiling:
     """Memory snapshot files location"""
 
     power_man: bool = False
-    max_adj: int = 8
+    max_adj: int = 15
     use_global: bool = True
     use_sum: bool = True
     use_max: bool = False
