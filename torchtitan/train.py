@@ -486,17 +486,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs, **extra_inputs, **extra_args)
-                    loss = self.loss_fn(pred, labels)
+                    with torch.autograd.profiler.record_function("cel"):
+                        loss = self.loss_fn(pred, labels)
                 # need to free pred before bwd to avoid peaking memory
                 del pred
-                loss.backward()
+                with torch.autograd.profiler.record_function("l"):
+                    loss.backward()
 
         return loss
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
-        self.optimizers.zero_grad()
+        with torch.autograd.profiler.record_function("opt_zg"):
+            self.optimizers.zero_grad()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
 
@@ -508,22 +511,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
         for _microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
+            with torch.autograd.profiler.record_function("dl"):
+                input_dict, labels = next(data_iterator)
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.job_config.training.max_norm,
-            foreach=True,
-            pp_mesh=(
-                parallel_dims.world_mesh["pp"] if parallel_dims.pp_enabled else None
-            ),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
+        with torch.autograd.profiler.record_function("opt_gc"):
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.job_config.training.max_norm,
+                foreach=True,
+                pp_mesh=(
+                    parallel_dims.world_mesh["pp"] if parallel_dims.pp_enabled else None
+                ),
+                ep_enabled=parallel_dims.ep_enabled,
+            )
         self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
+        with torch.autograd.profiler.record_function("opt_step"):
+            self.optimizers.step()
+        with torch.autograd.profiler.record_function("opt_lr"):
+            self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -609,7 +616,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.step += 1
                 self.gc_handler.run(self.step)
                 try:
-                    self.train_step(data_iterator)
+                    with torch.autograd.profiler.record_function(f"Iteration{self.step}"):
+                        self.train_step(data_iterator)
                 except DataloaderExhaustedError:
                     logger.warning("Ran out of data; last step was canceled.")
                     break
